@@ -68,12 +68,19 @@ $canPWReset = Factory::getContainer()->appConfig->get('pwreset', true);
             @endif
         </div>
 
-        <div class="mt-4 mb-1 d-flex flex-row {{ $canPWReset ? '' : 'justify-content-end' }}">
-            @if ($canPWReset)
-            <div class="flex-grow-1">
+        <div class="mt-4 mb-1 d-flex flex-row {{ ($canPWReset || $this->registrationEnabled) ? '' : 'justify-content-end' }}">
+            @if ($canPWReset || $this->registrationEnabled)
+            <div class="flex-grow-1 d-flex flex-column">
+                @if ($canPWReset)
                 <a href="@route('index.php?view=users&task=pwreset')"
-                   class="btn btn-link text-decoration-none"
+                   class="btn btn-link text-decoration-none p-0 mb-1 text-start"
                 >@lang('PANOPTICON_USERS_LBL_PWRESET_PROMPT')</a>
+                @endif
+                @if ($this->registrationEnabled)
+                <a href="@route('index.php?view=users&task=register')"
+                   class="btn btn-link text-decoration-none p-0 text-start"
+                >@lang('PANOPTICON_USERS_LBL_REGISTER_PROMPT')</a>
+                @endif
             </div>
             @endif
 
@@ -91,6 +98,18 @@ $canPWReset = Factory::getContainer()->appConfig->get('pwreset', true);
                 ) }}
             </div>
         </div>
+
+        @if ($this->registrationEnabled)
+        <div class="mt-3 text-center small">
+            <a href="@route('index.php?view=policies&task=tos')" class="text-decoration-none" target="_blank">
+                @lang('PANOPTICON_POLICIES_TITLE_TOS')
+            </a>
+            <span class="text-muted mx-1">|</span>
+            <a href="@route('index.php?view=policies&task=privacy')" class="text-decoration-none" target="_blank">
+                @lang('PANOPTICON_POLICIES_TITLE_PRIVACY')
+            </a>
+        </div>
+        @endif
 
         <input type="hidden" name="token" value="@token()">
         <input type="hidden" name="return"

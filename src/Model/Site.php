@@ -17,6 +17,7 @@ use Akeeba\Panopticon\Library\SiteInfo\Retriever;
 use Akeeba\Panopticon\Library\Task\Status;
 use Akeeba\Panopticon\Model\Trait\AdminToolsIntegrationTrait;
 use Akeeba\Panopticon\Model\Trait\AkeebaBackupIntegrationTrait;
+use Akeeba\Panopticon\Model\Trait\CoreChecksumsIntegrationTrait;
 use Akeeba\Panopticon\Model\Trait\ApplyUserGroupsToSiteQueryTrait;
 use Akeeba\Panopticon\Model\Trait\CmsFamilyFilterSeparatorTrait;
 use Akeeba\Panopticon\Model\Trait\SiteTestConnectionJoomlaTrait;
@@ -69,6 +70,7 @@ class Site extends DataModel
 	use ApiRequestTrait;
 	use AkeebaBackupIntegrationTrait;
 	use AdminToolsIntegrationTrait;
+	use CoreChecksumsIntegrationTrait;
 	use ApplyUserGroupsToSiteQueryTrait;
 	use JsonSanitizerTrait;
 	use CmsFamilyFilterSeparatorTrait;
@@ -260,6 +262,48 @@ class Site extends DataModel
 			$query->where(
 				$query->jsonExtract($db->quoteName('config'), '$.core.php') . ' LIKE ' . $query->quote(
 					'"' . $fltPHPFamily . '.%'
+				)
+			);
+		}
+
+		// Filter: extension name (exact match in site's extension list)
+		$fltExtName = $this->getState('ext_name', null, 'raw');
+
+		if (!empty($fltExtName))
+		{
+			$query->where(
+				$query->jsonContains(
+					$query->jsonExtract($db->quoteName('config'), '$.extensions.list.*.name'),
+					'JSON_QUOTE(' . $db->quote((string) $fltExtName) . ')',
+					null
+				)
+			);
+		}
+
+		// Filter: extension author
+		$fltExtAuthor = $this->getState('ext_author', null, 'raw');
+
+		if (!empty($fltExtAuthor))
+		{
+			$query->where(
+				$query->jsonContains(
+					$query->jsonExtract($db->quoteName('config'), '$.extensions.list.*.author'),
+					'JSON_QUOTE(' . $db->quote((string) $fltExtAuthor) . ')',
+					null
+				)
+			);
+		}
+
+		// Filter: extension author URL
+		$fltExtAuthorUrl = $this->getState('ext_author_url', null, 'raw');
+
+		if (!empty($fltExtAuthorUrl))
+		{
+			$query->where(
+				$query->jsonContains(
+					$query->jsonExtract($db->quoteName('config'), '$.extensions.list.*.authorUrl'),
+					'JSON_QUOTE(' . $db->quote((string) $fltExtAuthorUrl) . ')',
+					null
 				)
 			);
 		}

@@ -75,7 +75,25 @@ class Login extends Controller
 			$manager = $this->container->userManager;
 			$manager->loginUser($username, $password, ['secret' => $secret]);
 
+			// Check if the user is blocked (e.g. pending registration approval)
+			$loggedInUser = $manager->getUser();
+
+			if ($loggedInUser->getParameters()->get('block', false))
+			{
+				$logger->warning('Blocked user attempted login', ['username' => $username]);
+				$manager->logoutUser();
+
+				throw new InvalidUser($this->getContainer()->language->text('AWF_USER_ERROR_AUTHERROR'), 403);
+			}
+
 			$logger->info('Successful login', ['username' => $username]);
+
+			// Reset WebPush prompt "remind" timer so the prompt shows immediately after login
+			if ($loggedInUser->getParameters()->get('webpush.prompt_state') === 'remind')
+			{
+				$loggedInUser->getParameters()->set('webpush.prompt_until', 0);
+				$this->getContainer()->userManager->saveUser($loggedInUser);
+			}
 
 			// Redirect to the saved return_url or, if none specified, to the application's main page
 			$url    = $this->getReturnUrl();

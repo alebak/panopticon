@@ -76,6 +76,12 @@ class Html extends DataViewHtml
 
 	protected array|Throwable $scans = [];
 
+	protected int $coreChecksumsModifiedCount = 0;
+
+	protected ?int $coreChecksumsLastCheck = null;
+
+	protected ?bool $coreChecksumsLastStatus = null;
+
 	protected array $extensionFilters = [
 		'filter-updatesite'  => 'fa-globe',
 		'filter-dlid'        => 'fa-key',
@@ -368,18 +374,16 @@ class Html extends DataViewHtml
 		return $ret;
 	}
 
-	public function onBeforeRead(): bool
+	/**
+	 * Loads all data needed by the site read view section templates.
+	 *
+	 * Called by onBeforeRead() and by the refreshSections controller task.
+	 *
+	 * @return  void
+	 * @since   1.3.4
+	 */
+	public function prepareSiteReadData(): void
 	{
-		Template::addJs('media://js/site-read.js', $this->getContainer()->application, defer: true);
-
-		$this->setStrictLayout(true);
-		$this->setStrictTpl(true);
-
-		$router = $this->container->router;
-		$this->addButton('back', ['url' => $router->route('index.php?view=main')]);
-
-		$this->setTitle($this->getLanguage()->text('PANOPTICON_SITES_TITLE_READ'));
-
 		/** @noinspection PhpFieldAssignmentTypeMismatchInspection */
 		$this->item             = $this->getModel();
 		$this->canEdit          = $this->item->canEdit();
@@ -439,6 +443,60 @@ class Html extends DataViewHtml
 				$this->scans = $e;
 			}
 		}
+
+		// Core File Integrity Checksums
+		if ($this->item->cmsType() === CMSType::JOOMLA)
+		{
+			$this->coreChecksumsModifiedCount = (int) $this->siteConfig->get('core.coreChecksums.modifiedCount', 0);
+			$this->coreChecksumsLastCheck     = $this->siteConfig->get('core.coreChecksums.lastCheck', null);
+			$lastStatus                       = $this->siteConfig->get('core.coreChecksums.lastStatus', null);
+			$this->coreChecksumsLastStatus    = $lastStatus === null ? null : (bool) $lastStatus;
+		}
+
+		$this->cronStuckTime = $this->getCronStuckTime();
+	}
+
+	public function onBeforeRead(): bool
+	{
+		$app    = $this->getContainer()->application;
+		$doc    = $app->getDocument();
+		$router = $this->container->router;
+
+		Template::addJs('media://js/site-read.js', $app, defer: true);
+
+		// WebPush script options and JS
+		$token = $this->getContainer()->session->getCsrfToken()->getValue();
+
+		$doc->addScriptOptions(
+			'panopticon.webpush', [
+				'vapidPublicKey' => $this->getContainer()->vapidHelper->getPublicKey(),
+				'swUrl'          => Template::parsePath('js/sw.js', false, $app),
+				'subscribeUrl'   => $router->route(
+					sprintf("index.php?view=Pushsubscriptions&task=subscribe&format=json&%s=1", $token)
+				),
+				'unsubscribeUrl' => $router->route(
+					sprintf("index.php?view=Pushsubscriptions&task=unsubscribe&format=json&%s=1", $token)
+				),
+				'dismissUrl'     => $router->route(
+					sprintf("index.php?view=Pushsubscriptions&task=dismissPrompt&format=json&%s=1", $token)
+				),
+			]
+		);
+		$doc->lang('PANOPTICON_WEBPUSH_ERR_SUBSCRIBE_FAILED');
+		$doc->lang('PANOPTICON_WEBPUSH_ERR_PERMISSION_DENIED');
+		$doc->lang('PANOPTICON_WEBPUSH_LBL_STATUS_ACTIVE');
+		$doc->lang('PANOPTICON_WEBPUSH_LBL_STATUS_INACTIVE');
+		Template::addJs('media://js/webpush.js', $app, defer: true);
+
+		$this->setStrictLayout(true);
+		$this->setStrictTpl(true);
+
+		$router = $this->container->router;
+		$this->addButton('back', ['url' => $router->route('index.php?view=main')]);
+
+		$this->setTitle($this->getLanguage()->text('PANOPTICON_SITES_TITLE_READ'));
+
+		$this->prepareSiteReadData();
 
 		$hasAkeebaBackupPro = $this->item->hasAkeebaBackup() && $this->siteConfig->get('akeebabackup.info.api') > 1;
 		$hasAkeebaSoftware  = $hasAkeebaBackupPro || $this->hasAdminToolsPro;
@@ -526,6 +584,22 @@ class Html extends DataViewHtml
 			);
 		}
 
+		if ($this->item->cmsType() === CMSType::JOOMLA)
+		{
+			$dropdown->addButton(
+				new Button(
+					[
+						'id'    => 'checksumtasks',
+						'icon'  => 'fa fa-fw fa-fingerprint',
+						'title' => $this->getContainer()->language->text('PANOPTICON_CHECKSUMTASKS_TITLE'),
+						'url'   => $router->route(
+							sprintf("index.php?view=checksumtasks&site_id=%s&manual=0", $this->item->getId())
+						),
+					]
+				)
+			);
+		}
+
 		$this->container->application->getDocument()->getToolbar()->addButton($dropdown);
 
 		if ($this->canEdit)
@@ -588,8 +662,6 @@ class Html extends DataViewHtml
 			$this->container->application->getDocument()->getToolbar()->addButton($troubleshootDropdown);
 		}
 
-		$this->cronStuckTime = $this->getCronStuckTime();
-
 		$document = $this->container->application->getDocument();
 
 		$document->addScriptOptions(
@@ -613,6 +685,18 @@ class Html extends DataViewHtml
 				'enqueue' => $router->route(
 					sprintf(
 						'index.php?view=sites&task=akeebaBackupEnqueue&id=%d&%s=1', $this->item->id,
+						$this->container->session->getCsrfToken()->getValue()
+					)
+				),
+			]
+		);
+
+		$document->addScriptOptions(
+			'panopticon.siteRefresh', [
+				'url' => $router->route(
+					sprintf(
+						'index.php?view=site&task=refreshSections&id=%d&format=raw&%s=1',
+						$this->item->id,
 						$this->container->session->getCsrfToken()->getValue()
 					)
 				),

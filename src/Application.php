@@ -31,7 +31,7 @@ class Application extends AWFApplication
 	/**
 	 * List of view names we're allowed to access directly, without a login, and without redirection to the setup view
 	 */
-	private const NO_LOGIN_VIEWS = ['check', 'cron', 'login', 'setup', 'passkeys'];
+	private const NO_LOGIN_VIEWS = ['check', 'cron', 'login', 'setup', 'passkeys', 'policies', 'api'];
 
 	/**
 	 * Main menu structure
@@ -61,6 +61,11 @@ class Application extends AWFApplication
 					'view'        => 'coreupdates',
 					'permissions' => [],
 					'icon'        => 'fa fa-fw fa-atom',
+				],
+				[
+					'view'        => 'extensioninstall',
+					'permissions' => [],
+					'icon'        => 'fa fa-fw fa-download',
 				],
 				[
 					'url'   => null,
@@ -101,6 +106,12 @@ class Application extends AWFApplication
 					'view'        => 'mailtemplates',
 					'permissions' => ['panopticon.super'],
 					'icon'        => 'fa fa-fw fa-envelope',
+				],
+				[
+					'view'        => 'policies',
+					'task'        => 'edit',
+					'permissions' => ['panopticon.super'],
+					'icon'        => 'fa fa-fw fa-file-contract',
 				],
 				[
 					'url'         => null,
@@ -189,6 +200,12 @@ class Application extends AWFApplication
 					'title'       => 'PANOPTICON_USERS_TITLE_EDIT_MENU',
 					'permissions' => [],
 					'icon'        => 'fa fa-fw fa-user-gear',
+				],
+				[
+					'view'        => 'apitokens',
+					'title'       => 'PANOPTICON_APITOKENS_TITLE',
+					'permissions' => [],
+					'icon'        => 'fa fa-fw fa-key',
 				],
 				[
 					'view'        => 'login',
@@ -357,11 +374,20 @@ class Application extends AWFApplication
 		// Set up the media query key
 		$this->setupMediaVersioning();
 
-		// HTTP 103 early hints
-		$this->preloadHints();
-
 		// Set up the session
 		$this->container->session->start();
+
+		// Load routing information
+		$this->loadRoutes();
+
+		// Detect API requests early: skip all UI setup (MFA, consent, template, preload hints)
+		if ($this->isApiRequest())
+		{
+			return;
+		}
+
+		// HTTP 103 early hints
+		$this->preloadHints();
 
 		// Apply a forced language – but only if there is no logged-in user, or they have no language preference.
 		$forcedLanguage = $this->getContainer()->segment->get('panopticon.forced_language', null);
@@ -404,6 +430,7 @@ class Application extends AWFApplication
 
 			if (!$this->needsMFA())
 			{
+				$this->conditionalRedirectToConsent();
 				$this->conditionalRedirectToCaptiveSetup();
 				$this->conditionalRedirectToPasskeySetup();
 				$this->conditionalRedirectToCronSetup();
@@ -421,9 +448,6 @@ class Application extends AWFApplication
 				$this->conditionalRedirectToCaptive();
 			}
 		}
-
-		// Load routing information (reserved for future use)
-		$this->loadRoutes();
 
 		// Show the login page when necessary
 		$this->redirectToLogin();
@@ -456,6 +480,15 @@ class Application extends AWFApplication
 			if (
 				(($params['view'] ?? null) === 'sysconfig' || ($params['name'] ?? '') === 'separator01')
 				&& BootstrapUtilities::hasConfiguration(true)
+			)
+			{
+				$allowed = false;
+			}
+
+			// Do not show Legal Policies when user registration is disabled
+			if (
+				($params['view'] ?? null) === 'policies'
+				&& $this->container->appConfig->get('user_registration', 'disabled') === 'disabled'
 			)
 			{
 				$allowed = false;
@@ -733,7 +766,7 @@ class Application extends AWFApplication
 		/**
 		 * Special case: password reset
 		 */
-		if ($view === 'users' && in_array($task, ['pwreset', 'confirmreset']))
+		if ($view === 'users' && in_array($task, ['pwreset', 'confirmreset', 'register', 'activate']))
 		{
 			return;
 		}
@@ -773,6 +806,23 @@ class Application extends AWFApplication
 				'view' => 'login',
 			]
 		);
+	}
+
+	/**
+	 * Detect if the current request is an API request.
+	 *
+	 * Parses the URL through the router, checking if the view resolves to 'api'.
+	 *
+	 * @return  bool
+	 * @since   1.4.0
+	 */
+	private function isApiRequest(): bool
+	{
+		$this->container->router->parse();
+
+		$view = $this->container->input->getCmd('view', '');
+
+		return $view === 'api';
 	}
 
 	private function setupMediaVersioning(): void
@@ -824,7 +874,7 @@ class Application extends AWFApplication
 		/**
 		 * Special case: password reset
 		 */
-		if ($view === 'users' && in_array($task, ['pwreset', 'confirmreset']))
+		if ($view === 'users' && in_array($task, ['pwreset', 'confirmreset', 'register', 'activate']))
 		{
 			return;
 		}
@@ -837,6 +887,55 @@ class Application extends AWFApplication
 
 		// Let the user finish the installation at their own time
 		$this->redirect(Uri::rebase('index.php?view=setup&task=cron', $this->container));
+	}
+
+	private function conditionalRedirectToConsent(): void
+	{
+		// Only enforce consent when user registration is enabled
+		$registrationType = $this->container->appConfig->get('user_registration', 'disabled');
+
+		if ($registrationType === 'disabled')
+		{
+			return;
+		}
+
+		// User must be logged in
+		$user = $this->getContainer()->userManager->getUser();
+
+		if (!$user->getId())
+		{
+			return;
+		}
+
+		// Already consented
+		if ($user->getParameters()->get('consent.tos', false))
+		{
+			return;
+		}
+
+		// Allow access to certain views without consent
+		$view = strtolower($this->getContainer()->input->getCmd('view', ''));
+		$task = strtolower($this->getContainer()->input->getCmd('task', ''));
+
+		$allowedViews = [
+			'userconsent', 'policies', 'login', 'logout', 'cron', 'check',
+			'setup', 'passkeys', 'captive', 'mfamethods',
+		];
+
+		if (in_array($view, $allowedViews))
+		{
+			return;
+		}
+
+		// Allow password reset, registration, and activation
+		if ($view === 'users' && in_array($task, ['pwreset', 'confirmreset', 'register', 'activate']))
+		{
+			return;
+		}
+
+		$this->redirect(
+			$this->container->router->route('index.php?view=userconsent')
+		);
 	}
 
 	private function conditionalRedirectToCaptive(): void

@@ -11,6 +11,7 @@ defined('AKEEBA') || die;
 
 use Akeeba\Panopticon\Controller\Trait\ACLTrait;
 use Akeeba\Panopticon\Factory;
+use Akeeba\Panopticon\Library\Captcha\CaptchaFactory;
 use Akeeba\Panopticon\Library\Passkey\Authentication;
 use Akeeba\Panopticon\View\Users\Html;
 use Awf\Mvc\DataController;
@@ -58,7 +59,7 @@ class Users extends DataController
 
 			$logger->info(
 				sprintf(
-					'Created a password reset request for username ‘%s’, email ‘%s’',
+					'Created a password reset request for username \'%s\', email \'%s\'',
 					$username,
 					$email
 				)
@@ -71,7 +72,7 @@ class Users extends DataController
 		{
 			$logger->warning(
 				sprintf(
-					'Could not create a password reset request for username ‘%s’, email ‘%s’. Reason: %s',
+					'Could not create a password reset request for username \'%s\', email \'%s\'. Reason: %s',
 					$username,
 					$email,
 					$e->getMessage()
@@ -144,7 +145,7 @@ class Users extends DataController
 		{
 			$logger->debug(
 				sprintf(
-					'Evaluating password reset for username ‘%s’.',
+					'Evaluating password reset for username \'%s\'.',
 					$user->getUsername()
 				)
 			);
@@ -152,7 +153,7 @@ class Users extends DataController
 
 			$logger->info(
 				sprintf(
-					'Successful password reset for username ‘%s’.',
+					'Successful password reset for username \'%s\'.',
 					$user->getUsername()
 				)
 			);
@@ -164,7 +165,7 @@ class Users extends DataController
 		{
 			$logger->error(
 				sprintf(
-					'Failed password reset for username ‘%s’. Reason: %s',
+					'Failed password reset for username \'%s\'. Reason: %s',
 					$user->getUsername(),
 					$e->getMessage()
 				)
@@ -181,6 +182,253 @@ class Users extends DataController
 		}
 
 		$this->setRedirect($router->route('index.php'), $message, $type);
+	}
+
+	/**
+	 * User self-registration
+	 *
+	 * @return  void
+	 * @throws  \Exception
+	 */
+	public function register(): void
+	{
+		$container = Factory::getContainer();
+		$router    = $container->router;
+		$lang      = $container->language;
+		$appConfig = $container->appConfig;
+
+		$registrationType = $appConfig->get('user_registration', 'disabled');
+
+		// If registration is disabled, redirect with an error
+		if (!in_array($registrationType, ['admin', 'self'], true))
+		{
+			$this->setRedirect(
+				$router->route('index.php'),
+				$lang->text('PANOPTICON_USERS_ERR_REGISTRATION_DISABLED'),
+				'error'
+			);
+
+			return;
+		}
+
+		// Check for form data (POST request)
+		$username  = $this->input->getUsername('username', '');
+		$email     = $this->input->get('email', '', 'raw');
+		$name      = $this->input->getString('name', '');
+		$password  = $this->input->get('password', '', 'raw');
+		$password2 = $this->input->get('password2', '', 'raw');
+
+		// If no form data, show the registration form
+		if (empty($username) || empty($email))
+		{
+			$this->getView()->setLayout('register');
+			$this->display();
+
+			return;
+		}
+
+		$logger = Factory::getContainer()->loggerFactory->get('login');
+
+		try
+		{
+			// Validate CAPTCHA
+			$captchaProvider = $appConfig->get('captcha_provider', 'altcha');
+			$captcha         = CaptchaFactory::make($captchaProvider, $container);
+
+			if ($captcha !== null && !$captcha->validateResponse())
+			{
+				throw new RuntimeException($lang->text('PANOPTICON_USERS_ERR_CAPTCHA_FAILED'));
+			}
+
+			// Validate passwords match
+			if ($password !== $password2)
+			{
+				throw new RuntimeException($lang->text('PANOPTICON_USERS_ERR_PASSWORD_MISMATCH'));
+			}
+
+			/** @var \Akeeba\Panopticon\Model\Users $model */
+			$model = $this->getModel();
+			$user  = $model->createRegistration($username, $email, $password, $name);
+
+			$logger->info(
+				sprintf(
+					'New user registration: username \'%s\', email \'%s\', type \'%s\'',
+					$username,
+					$email,
+					$registrationType
+				)
+			);
+
+			$message = ($registrationType === 'admin')
+				? $lang->text('PANOPTICON_USERS_LBL_REGISTER_SUCCESS_ADMIN')
+				: $lang->text('PANOPTICON_USERS_LBL_REGISTER_SUCCESS_SELF');
+
+			$this->setRedirect(
+				$router->route('index.php'),
+				$message,
+				'success'
+			);
+		}
+		catch (\Throwable $e)
+		{
+			$logger->warning(
+				sprintf(
+					'Failed registration attempt: username \'%s\', email \'%s\'. Reason: %s',
+					$username,
+					$email,
+					$e->getMessage()
+				)
+			);
+
+			$this->setRedirect(
+				$router->route('index.php?view=users&task=register'),
+				$e->getMessage(),
+				'error'
+			);
+		}
+	}
+
+	/**
+	 * User account activation (self-approval mode)
+	 *
+	 * @return  void
+	 * @throws  \Exception
+	 */
+	public function activate(): void
+	{
+		$container = Factory::getContainer();
+		$router    = $container->router;
+		$lang      = $container->language;
+		$appConfig = $container->appConfig;
+
+		$registrationType = $appConfig->get('user_registration', 'disabled');
+
+		// If registration is not self-approval, redirect
+		if ($registrationType !== 'self')
+		{
+			$this->setRedirect($router->route('index.php'));
+
+			return;
+		}
+
+		$id       = $this->input->getInt('id', 0);
+		$token    = $this->input->getString('token', '');
+		$username = $this->input->getUsername('username', '');
+		$password = $this->input->get('password', '', 'raw');
+
+		// We need a user ID
+		if ($id == 0)
+		{
+			$this->setRedirect($router->route('index.php'));
+
+			return;
+		}
+
+		// Load the user
+		$user = $container->userManager->getUser($id);
+
+		if (!$user || !$user->getId())
+		{
+			$this->setRedirect($router->route('index.php'));
+
+			return;
+		}
+
+		// Verify the user has a pending self-registration
+		if ($user->getParameters()->get('registration.type') !== 'self' ||
+			empty($user->getParameters()->get('registration.secret', '')))
+		{
+			$this->setRedirect($router->route('index.php'));
+
+			return;
+		}
+
+		// If no username/password/token provided, show the activation form
+		if (empty($username) || empty($password))
+		{
+			/** @var Html $view */
+			$view        = $this->getView();
+			$view->user  = $user;
+			$view->token = $token;
+
+			$view->setLayout('activate');
+			$this->display();
+
+			return;
+		}
+
+		$logger = Factory::getContainer()->loggerFactory->get('login');
+
+		/** @var \Akeeba\Panopticon\Model\Users $model */
+		$model = $this->getModel();
+
+		// Check activation time expiry
+		$maxDays     = (int) $appConfig->get('user_registration_activation_days', 7);
+		$createdTime = (int) $user->getParameters()->get('registration.created', 0);
+		$maxTime     = $createdTime + ($maxDays * 86400);
+
+		if (time() > $maxTime)
+		{
+			$logger->info(sprintf('Activation expired for user \'%s\' (time limit)', $user->getUsername()));
+
+			$model->sendExpiredAndDelete($user);
+
+			$this->setRedirect(
+				$router->route('index.php'),
+				$lang->text('PANOPTICON_USERS_LBL_ACTIVATE_EXPIRED'),
+				'error'
+			);
+
+			return;
+		}
+
+		// Check activation tries
+		$maxTries     = (int) $appConfig->get('user_registration_activation_tries', 3);
+		$currentTries = (int) $user->getParameters()->get('registration.activation_tries', 0);
+
+		if ($currentTries >= $maxTries)
+		{
+			$logger->info(sprintf('Activation expired for user \'%s\' (too many tries)', $user->getUsername()));
+
+			$model->sendExpiredAndDelete($user);
+
+			$this->setRedirect(
+				$router->route('index.php'),
+				$lang->text('PANOPTICON_USERS_LBL_ACTIVATE_EXPIRED'),
+				'error'
+			);
+
+			return;
+		}
+
+		// Try to validate the token
+		if (!$model->validateActivationToken($user, $username, $password, $token))
+		{
+			// Increment tries
+			$user->getParameters()->set('registration.activation_tries', $currentTries + 1);
+			$container->userManager->saveUser($user);
+
+			$logger->warning(sprintf('Failed activation attempt for user \'%s\'', $user->getUsername()));
+
+			$this->setRedirect(
+				$router->route(sprintf('index.php?view=users&task=activate&id=%d', $id)),
+				$lang->text('PANOPTICON_USERS_LBL_ACTIVATE_FAILED'),
+				'error'
+			);
+
+			return;
+		}
+
+		// Activation successful
+		$model->activateRegistration($user);
+
+		$logger->info(sprintf('User \'%s\' successfully activated their account', $user->getUsername()));
+
+		$this->setRedirect(
+			$router->route('index.php'),
+			$lang->text('PANOPTICON_USERS_LBL_ACTIVATE_SUCCESS'),
+			'success'
+		);
 	}
 
 	protected function onBeforeEdit()
@@ -268,6 +516,9 @@ class Users extends DataController
 		$savedUser     = $this->container->userManager->getUser($id);
 		$isNewUser     = empty($id) || ($savedUser->getId() != $id);
 		$editingMyself = $savedUser->getId() == $myself->getId();
+
+		// Track blocked state for registration approval flow
+		$wasBlocked = !$isNewUser && $savedUser->getParameters()->get('block', false);
 
 		// Get the applicable data
 		$data = [
@@ -430,6 +681,13 @@ class Users extends DataController
 			$savedUser->getParameters()->set('pwreset.secret', '');
 
 			$this->container->userManager->saveUser($savedUser);
+
+			// Check if this was an admin approval of a registration
+			if ($wasBlocked)
+			{
+				$isNowBlocked = $savedUser->getParameters()->get('block', false);
+				$this->getModel()->handleAdminApproval($savedUser, true, $isNowBlocked);
+			}
 
 			$status = true;
 

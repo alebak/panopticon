@@ -10,6 +10,8 @@ namespace Akeeba\Panopticon\Model;
 defined('AKEEBA') || die;
 
 use Akeeba\Panopticon\Factory;
+use Akeeba\Panopticon\Helper\ForbiddenUsernames;
+use Complexify\Complexify;
 use Akeeba\Panopticon\Library\MultiFactorAuth\MFATrait;
 use Akeeba\Panopticon\Library\Passkey\PasskeyTrait;
 use Akeeba\Panopticon\Model\Trait\UserAvatarTrait;
@@ -17,6 +19,7 @@ use Akeeba\Panopticon\Task\Trait\EmailSendingTrait;
 use Awf\Container\Container;
 use Awf\Mvc\DataModel;
 use Awf\Registry\Registry;
+use Awf\Uri\Uri;
 use Awf\User\User;
 use Awf\User\UserInterface;
 use RuntimeException;
@@ -367,11 +370,791 @@ class Users extends DataModel
 		}
 	}
 
+	/**
+	 * Create a new user registration.
+	 *
+	 * @param   string  $username  The desired username
+	 * @param   string  $email     The email address
+	 * @param   string  $password  The password
+	 * @param   string  $name      The full name
+	 *
+	 * @return  User  The created user object
+	 */
+	public function createRegistration(string $username, string $email, string $password, string $name): User
+	{
+		$container   = Factory::getContainer();
+		$appConfig   = $container->appConfig;
+		$userManager = $container->userManager;
+		$lang        = $container->language;
+
+		$registrationType = $appConfig->get('user_registration', 'disabled');
+
+		if (!in_array($registrationType, ['admin', 'self'], true))
+		{
+			throw new RuntimeException($lang->text('PANOPTICON_USERS_ERR_REGISTRATION_DISABLED'));
+		}
+
+		// Validate username
+		$username = trim($username);
+
+		if (empty($username))
+		{
+			throw new RuntimeException($lang->text('PANOPTICON_SETUP_ERR_USER_EMPTYUSERNAME'));
+		}
+
+		// Check forbidden usernames
+		if (ForbiddenUsernames::isForbidden($username, $container))
+		{
+			throw new RuntimeException($lang->text('PANOPTICON_USERS_ERR_FORBIDDEN_USERNAME'));
+		}
+
+		// Check username uniqueness
+		if ($userManager->getUserByUsername($username) !== null)
+		{
+			throw new RuntimeException(
+				$lang->sprintf('PANOPTICON_USERS_ERR_USERNAME_EXISTS', htmlentities($username))
+			);
+		}
+
+		// Validate email
+		$email = strtolower(trim($email));
+
+		if (filter_var($email, FILTER_VALIDATE_EMAIL) === false)
+		{
+			throw new RuntimeException(
+				$lang->sprintf('PANOPTICON_USERS_ERR_INVALID_EMAIL', htmlentities($email))
+			);
+		}
+
+		// Check email domain
+		$this->validateEmailDomain($email);
+
+		// Check email uniqueness
+		$db    = $this->getDbo();
+		$query = $db->getQuery(true)
+			->select('COUNT(*)')
+			->from($db->quoteName('#__users'))
+			->where($db->quoteName('email') . ' = ' . $db->quote($email));
+
+		if ((int) $db->setQuery($query)->loadResult() > 0)
+		{
+			throw new RuntimeException($lang->text('PANOPTICON_USERS_ERR_EMAIL_EXISTS'));
+		}
+
+		// Validate name
+		$name = trim($name);
+
+		if (empty($name))
+		{
+			throw new RuntimeException($lang->text('PANOPTICON_USERS_ERR_EMPTY_NAME'));
+		}
+
+		// Validate password
+		if (empty($password))
+		{
+			throw new RuntimeException($lang->text('PANOPTICON_USERS_ERR_NEEDS_PASSWORD'));
+		}
+
+		// Validate password complexity
+		$complexify = new Complexify([
+			'minimumChars' => 12,
+			'encoding'     => 'UTF-8',
+		]);
+
+		$result = $complexify->evaluateSecurity($password);
+
+		if (!$result->valid)
+		{
+			if (in_array('banned', $result->errors))
+			{
+				throw new RuntimeException($lang->text('PANOPTICON_USERS_ERR_PASSWORD_BANNED'));
+			}
+			elseif (in_array('tooshort', $result->errors))
+			{
+				throw new RuntimeException($lang->text('PANOPTICON_USERS_ERR_PASSWORD_TOOSHORT'));
+			}
+
+			throw new RuntimeException($lang->text('PANOPTICON_USERS_ERR_PASSWORD_WEAK'));
+		}
+
+		// Create the user (blocked by default)
+		$user = new User();
+		$user->setUsername($username);
+		$user->setName($name);
+		$user->setEmail($email);
+		$user->setPassword($password);
+
+		// Set registration parameters
+		$user->getParameters()->set('registration.created', time());
+		$user->getParameters()->set('registration.type', $registrationType);
+		$user->getParameters()->set('registration.activation_tries', 0);
+
+		// Assign to default group
+		$defaultGroup = (int) $appConfig->get('user_registration_default_group', 0);
+
+		if ($defaultGroup > 0)
+		{
+			$user->getParameters()->set('usergroups', [$defaultGroup]);
+		}
+
+		// Block the user (pending activation or admin approval)
+		$user->getParameters()->set('block', true);
+
+		$userManager->saveUser($user);
+
+		// Send appropriate email
+		if ($registrationType === 'admin')
+		{
+			$this->sendRegistrationPendingAdminEmail($user);
+			$this->sendRegistrationNotifyAdminEmail($user);
+		}
+		elseif ($registrationType === 'self')
+		{
+			$this->sendRegistrationActivateEmail($user);
+		}
+
+		return $user;
+	}
+
+	/**
+	 * Validate the activation token for a self-registration.
+	 *
+	 * @param   User    $user      The user to activate
+	 * @param   string  $username  The submitted username
+	 * @param   string  $password  The submitted password
+	 * @param   string  $token     The submitted activation token
+	 *
+	 * @return  bool  True if the token is valid
+	 */
+	public function validateActivationToken(User $user, string $username, string $password, string $token): bool
+	{
+		$container = Factory::getContainer();
+		$appConfig = $container->appConfig;
+
+		// Check registration type
+		$regType = $user->getParameters()->get('registration.type', null);
+
+		if ($regType !== 'self')
+		{
+			return false;
+		}
+
+		// Check if there's a stored secret
+		$secretEncoded = $user->getParameters()->get('registration.secret', '');
+
+		if (empty($secretEncoded))
+		{
+			return false;
+		}
+
+		// Check activation tries
+		$maxTries    = (int) $appConfig->get('user_registration_activation_tries', 3);
+		$currentTries = (int) $user->getParameters()->get('registration.activation_tries', 0);
+
+		if ($currentTries >= $maxTries)
+		{
+			return false;
+		}
+
+		// Check activation time
+		$maxDays     = (int) $appConfig->get('user_registration_activation_days', 7);
+		$createdTime = (int) $user->getParameters()->get('registration.created', 0);
+		$maxTime     = $createdTime + ($maxDays * 86400);
+
+		if (time() > $maxTime)
+		{
+			return false;
+		}
+
+		// Verify username matches
+		if ($user->getUsername() !== $username)
+		{
+			return false;
+		}
+
+		// Verify password
+		if (!password_verify($password, $user->getPassword()))
+		{
+			return false;
+		}
+
+		// Verify the HMAC token
+		try
+		{
+			$secret = base64_decode($secretEncoded);
+		}
+		catch (\Throwable)
+		{
+			return false;
+		}
+
+		$expectedToken = hash_hmac(
+			'sha1',
+			implode(':', [$user->getUsername(), $user->getEmail(), $user->getPassword()]),
+			$secret
+		);
+
+		return hash_equals($expectedToken, $token);
+	}
+
+	/**
+	 * Activate a registered user account.
+	 *
+	 * @param   User  $user  The user to activate
+	 *
+	 * @return  void
+	 */
+	public function activateRegistration(User $user): void
+	{
+		$container = Factory::getContainer();
+
+		// Unblock user
+		$user->getParameters()->set('block', false);
+
+		// Clear registration parameters
+		$user->getParameters()->set('registration.created', null);
+		$user->getParameters()->set('registration.type', null);
+		$user->getParameters()->set('registration.activation_tries', null);
+		$user->getParameters()->set('registration.secret', null);
+
+		$container->userManager->saveUser($user);
+
+		// Send approval email
+		$this->sendRegistrationApprovedEmail($user);
+	}
+
+	/**
+	 * Clean up stale registrations that have exceeded their activation period.
+	 *
+	 * @return  int  The number of deleted stale registrations
+	 */
+	public function cleanupStaleRegistrations(): int
+	{
+		$container = Factory::getContainer();
+		$appConfig = $container->appConfig;
+		$maxDays   = (int) $appConfig->get('user_registration_activation_days', 7);
+		$maxTime   = time() - ($maxDays * 86400);
+		$deleted   = 0;
+
+		$db    = $this->getDbo();
+		$query = $db->getQuery(true)
+			->select([
+				$db->quoteName('id'),
+				$db->quoteName('parameters'),
+			])
+			->from($db->quoteName('#__users'));
+
+		// Find users with registration.created parameter
+		$query->where(
+			$query->jsonExtract($db->quoteName('parameters'), '$.registration.created') . ' IS NOT NULL'
+		);
+		$query->where(
+			$query->jsonExtract($db->quoteName('parameters'), '$.registration.created') . ' > 0'
+		);
+
+		$users = $db->setQuery($query)->loadObjectList() ?: [];
+
+		foreach ($users as $userRecord)
+		{
+			try
+			{
+				$params = new Registry($userRecord->parameters);
+				$created = (int) $params->get('registration.created', 0);
+
+				if ($created > 0 && $created < $maxTime)
+				{
+					$user = $container->userManager->getUser($userRecord->id);
+
+					// Send expired notification
+					$this->sendRegistrationExpiredEmail($user);
+
+					// Delete the user
+					$deleteQuery = $db->getQuery(true)
+						->delete($db->quoteName('#__users'))
+						->where($db->quoteName('id') . ' = ' . (int) $userRecord->id);
+
+					$db->setQuery($deleteQuery)->execute();
+
+					$deleted++;
+				}
+			}
+			catch (\Throwable)
+			{
+				// Silently continue
+			}
+		}
+
+		return $deleted;
+	}
+
+	/**
+	 * Check if a user was just unblocked by an admin (for registration approval flow).
+	 *
+	 * Should be called after saving a user who was previously blocked.
+	 *
+	 * @param   User   $user            The user being saved
+	 * @param   bool   $wasBlocked      Whether the user was previously blocked
+	 * @param   bool   $isNowBlocked    Whether the user is now blocked
+	 *
+	 * @return  void
+	 */
+	public function handleAdminApproval(User $user, bool $wasBlocked, bool $isNowBlocked): void
+	{
+		if (!$wasBlocked || $isNowBlocked)
+		{
+			return;
+		}
+
+		$regType = $user->getParameters()->get('registration.type', null);
+
+		if ($regType !== 'admin')
+		{
+			return;
+		}
+
+		// Clear registration parameters
+		$user->getParameters()->set('registration.created', null);
+		$user->getParameters()->set('registration.type', null);
+		$user->getParameters()->set('registration.activation_tries', null);
+
+		Factory::getContainer()->userManager->saveUser($user);
+
+		// Send approval email
+		$this->sendRegistrationApprovedEmail($user);
+	}
+
+	/**
+	 * Send an expiration email and delete the user.
+	 *
+	 * @param   User  $user  The user to expire
+	 *
+	 * @return  void
+	 */
+	public function sendExpiredAndDelete(User $user): void
+	{
+		$this->sendRegistrationExpiredEmail($user);
+
+		$db = $this->getDbo();
+		$query = $db->getQuery(true)
+			->delete($db->quoteName('#__users'))
+			->where($db->quoteName('id') . ' = ' . (int) $user->getId());
+
+		$db->setQuery($query)->execute();
+	}
+
+	/**
+	 * Validate an email address domain against allowed/disallowed lists.
+	 *
+	 * @param   string  $email  The email to validate
+	 *
+	 * @return  void
+	 * @throws  RuntimeException  If the domain is not allowed
+	 */
+	private function validateEmailDomain(string $email): void
+	{
+		$container = Factory::getContainer();
+		$appConfig = $container->appConfig;
+		$lang      = $container->language;
+
+		$domain = strtolower(substr($email, strrpos($email, '@') + 1));
+
+		// Check allowed domains (if configured)
+		$allowedDomains = trim((string) $appConfig->get('user_registration_allowed_domains', ''));
+
+		if (!empty($allowedDomains))
+		{
+			$allowed = array_map(
+				fn($line) => strtolower(trim($line)),
+				preg_split('/[\s,]+/', $allowedDomains, -1, PREG_SPLIT_NO_EMPTY)
+			);
+
+			if (!empty($allowed) && !in_array($domain, $allowed, true))
+			{
+				throw new RuntimeException($lang->text('PANOPTICON_USERS_ERR_EMAIL_DOMAIN_NOT_ALLOWED'));
+			}
+		}
+
+		// Check disallowed domains
+		$disallowedDomains = trim((string) $appConfig->get('user_registration_disallowed_domains', ''));
+
+		if (!empty($disallowedDomains))
+		{
+			$disallowed = array_map(
+				fn($line) => strtolower(trim($line)),
+				preg_split('/[\s,]+/', $disallowedDomains, -1, PREG_SPLIT_NO_EMPTY)
+			);
+
+			if (in_array($domain, $disallowed, true))
+			{
+				throw new RuntimeException($lang->text('PANOPTICON_USERS_ERR_EMAIL_DOMAIN_NOT_ALLOWED'));
+			}
+		}
+	}
+
+	/**
+	 * Send the "registration pending admin approval" email to the user.
+	 *
+	 * @param   User  $user  The registered user
+	 *
+	 * @return  void
+	 */
+	private function sendRegistrationPendingAdminEmail(User $user): void
+	{
+		$container = Factory::getContainer();
+		$data      = new Registry();
+
+		$data->set('template', 'registration_pending_admin');
+		$data->set('email_variables', [
+			'NAME'     => $user->getName(),
+			'USERNAME' => $user->getUsername(),
+			'EMAIL'    => $user->getEmail(),
+			'SITENAME' => $container->appConfig->get('fromname', 'Panopticon'),
+			'SITEURL'  => Uri::base(),
+		]);
+		$data->set('recipient_id', $user->getId());
+
+		$this->enqueueEmail($data, null);
+	}
+
+	/**
+	 * Notify administrators that a new user is awaiting approval.
+	 *
+	 * @param   User  $user  The registered user
+	 *
+	 * @return  void
+	 */
+	private function sendRegistrationNotifyAdminEmail(User $user): void
+	{
+		$container = Factory::getContainer();
+		$data      = new Registry();
+
+		$adminUrl = Uri::base() . $container->router->route('index.php?view=users');
+
+		$data->set('template', 'registration_notify_admin');
+		$data->set('email_variables', [
+			'NAME'      => $user->getName(),
+			'USERNAME'  => $user->getUsername(),
+			'EMAIL'     => $user->getEmail(),
+			'SITENAME'  => $container->appConfig->get('fromname', 'Panopticon'),
+			'SITEURL'   => Uri::base(),
+			'ADMIN_URL' => $adminUrl,
+		]);
+		$data->set('permissions', ['panopticon.super', 'panopticon.admin']);
+
+		$this->enqueueEmail($data, null);
+	}
+
+	/**
+	 * Send the "activate your account" email to the user (self-approval mode).
+	 *
+	 * @param   User  $user  The registered user
+	 *
+	 * @return  void
+	 */
+	private function sendRegistrationActivateEmail(User $user): void
+	{
+		$container = Factory::getContainer();
+		$appConfig = $container->appConfig;
+
+		// Generate activation secret and token
+		$secret = random_bytes(64);
+		$token  = hash_hmac(
+			'sha1',
+			implode(':', [$user->getUsername(), $user->getEmail(), $user->getPassword()]),
+			$secret
+		);
+
+		// Store the secret on the user
+		$user->getParameters()->set('registration.secret', base64_encode($secret));
+		$container->userManager->saveUser($user);
+
+		// Build the activation URL
+		$activationUrl = Uri::base() . $container->router->route(
+			sprintf(
+				'index.php?view=users&task=activate&id=%d&token=%s',
+				$user->getId(),
+				$token
+			)
+		);
+
+		$data = new Registry();
+		$data->set('template', 'registration_activate');
+		$data->set('email_variables', [
+			'NAME'           => $user->getName(),
+			'USERNAME'       => $user->getUsername(),
+			'EMAIL'          => $user->getEmail(),
+			'ACTIVATION_URL' => $activationUrl,
+			'TOKEN'          => $token,
+			'SITENAME'       => $appConfig->get('fromname', 'Panopticon'),
+			'SITEURL'        => Uri::base(),
+			'EXPIRY_DAYS'    => (string) (int) $appConfig->get('user_registration_activation_days', 7),
+		]);
+		$data->set('recipient_id', $user->getId());
+
+		$this->enqueueEmail($data, null);
+	}
+
+	/**
+	 * Send the "account approved/activated" email to the user.
+	 *
+	 * @param   User  $user  The user
+	 *
+	 * @return  void
+	 */
+	private function sendRegistrationApprovedEmail(User $user): void
+	{
+		$container = Factory::getContainer();
+		$data      = new Registry();
+
+		$loginUrl = Uri::base() . $container->router->route('index.php?view=login');
+
+		$data->set('template', 'registration_approved');
+		$data->set('email_variables', [
+			'NAME'      => $user->getName(),
+			'USERNAME'  => $user->getUsername(),
+			'EMAIL'     => $user->getEmail(),
+			'SITENAME'  => $container->appConfig->get('fromname', 'Panopticon'),
+			'SITEURL'   => Uri::base(),
+			'LOGIN_URL' => $loginUrl,
+		]);
+		$data->set('recipient_id', $user->getId());
+
+		$this->enqueueEmail($data, null);
+	}
+
+	/**
+	 * Send the "registration expired" email to the user.
+	 *
+	 * @param   User  $user  The user
+	 *
+	 * @return  void
+	 */
+	private function sendRegistrationExpiredEmail(User $user): void
+	{
+		$container = Factory::getContainer();
+		$data      = new Registry();
+
+		$data->set('template', 'registration_expired');
+		$data->set('email_variables', [
+			'NAME'     => $user->getName(),
+			'USERNAME' => $user->getUsername(),
+			'EMAIL'    => $user->getEmail(),
+			'SITENAME' => $container->appConfig->get('fromname', 'Panopticon'),
+			'SITEURL'  => Uri::base(),
+		]);
+		$data->set('recipient_id', $user->getId());
+
+		$this->enqueueEmail($data, null);
+	}
+
+	/**
+	 * Check if a user has given consent to the Terms of Service.
+	 *
+	 * @param   int  $userId  The user ID
+	 *
+	 * @return  bool
+	 * @since   1.3.0
+	 */
+	public function hasConsent(int $userId): bool
+	{
+		$user = $this->container->userManager->getUser($userId);
+
+		if (!$user->getId())
+		{
+			return false;
+		}
+
+		return (bool) $user->getParameters()->get('consent.tos', false);
+	}
+
+	/**
+	 * Record that a user has given consent to the Terms of Service.
+	 *
+	 * @param   int  $userId  The user ID
+	 *
+	 * @return  void
+	 * @since   1.3.0
+	 */
+	public function setConsent(int $userId): void
+	{
+		$user = $this->container->userManager->getUser($userId);
+
+		if (!$user->getId())
+		{
+			return;
+		}
+
+		$user->getParameters()->set('consent.tos', true);
+		$user->getParameters()->set('consent.timestamp', time());
+
+		$this->container->userManager->saveUser($user);
+	}
+
+	/**
+	 * Can a user self-delete their account?
+	 *
+	 * Only allowed when the user is not the last superuser account.
+	 *
+	 * @param   int  $userId  The user ID
+	 *
+	 * @return  bool
+	 * @since   1.3.0
+	 */
+	public function canSelfDelete(int $userId): bool
+	{
+		return !$this->isLastSuperUserAccount($userId);
+	}
+
+	/**
+	 * Export a user's personal data as XML.
+	 *
+	 * @param   int  $userId  The user ID
+	 *
+	 * @return  string  The XML export
+	 * @since   1.3.0
+	 */
+	public function exportUserDataXml(int $userId): string
+	{
+		$user = $this->container->userManager->getUser($userId);
+
+		if (!$user->getId())
+		{
+			throw new RuntimeException('User not found.', 404);
+		}
+
+		$db = $this->getDbo();
+
+		// Get owned sites
+		$query = $db->getQuery(true)
+			->select([
+				$db->quoteName('id'),
+				$db->quoteName('name'),
+				$db->quoteName('url'),
+				$db->quoteName('created_on'),
+			])
+			->from($db->quoteName('#__sites'))
+			->where($db->quoteName('created_by') . ' = ' . $db->quote($userId));
+
+		$sites = $db->setQuery($query)->loadObjectList() ?: [];
+
+		// Get MFA method titles
+		$query = $db->getQuery(true)
+			->select([
+				$db->quoteName('title'),
+				$db->quoteName('method'),
+			])
+			->from($db->quoteName('#__mfa'))
+			->where($db->quoteName('user_id') . ' = ' . $db->quote($userId));
+
+		$mfaMethods = $db->setQuery($query)->loadObjectList() ?: [];
+
+		// Get passkey labels
+		$query = $db->getQuery(true)
+			->select([
+				$db->quoteName('label'),
+			])
+			->from($db->quoteName('#__passkeys'))
+			->where($db->quoteName('user_id') . ' = ' . $db->quote($userId));
+
+		$passkeys = $db->setQuery($query)->loadObjectList() ?: [];
+
+		// Build XML
+		$xml = new \SimpleXMLElement('<?xml version="1.0" encoding="UTF-8"?><userdata/>');
+		$xml->addAttribute('exported', date('c'));
+		$xml->addAttribute('version', '1.0');
+
+		// Profile
+		$profile = $xml->addChild('profile');
+		$profile->addChild('id', (string) $user->getId());
+		$profile->addChild('username', htmlspecialchars($user->getUsername(), ENT_XML1));
+		$profile->addChild('name', htmlspecialchars($user->getName(), ENT_XML1));
+		$profile->addChild('email', htmlspecialchars($user->getEmail(), ENT_XML1));
+
+		$consentNode = $profile->addChild('consent');
+		$consentNode->addChild('tos', $user->getParameters()->get('consent.tos', false) ? 'true' : 'false');
+		$consentTimestamp = $user->getParameters()->get('consent.timestamp', null);
+		$consentNode->addChild(
+			'timestamp',
+			$consentTimestamp ? date('c', (int) $consentTimestamp) : ''
+		);
+
+		// Sites
+		$sitesNode = $xml->addChild('sites');
+
+		foreach ($sites as $site)
+		{
+			$siteNode = $sitesNode->addChild('site');
+			$siteNode->addChild('id', (string) $site->id);
+			$siteNode->addChild('name', htmlspecialchars($site->name, ENT_XML1));
+			$siteNode->addChild('url', htmlspecialchars($site->url, ENT_XML1));
+			$siteNode->addChild('created_on', $site->created_on ?? '');
+		}
+
+		// MFA Methods
+		$mfaNode = $xml->addChild('mfa_methods');
+
+		foreach ($mfaMethods as $method)
+		{
+			$methodNode = $mfaNode->addChild('method');
+			$methodNode->addChild('title', htmlspecialchars($method->title, ENT_XML1));
+			$methodNode->addChild('type', htmlspecialchars($method->method, ENT_XML1));
+		}
+
+		// Passkeys
+		$passkeysNode = $xml->addChild('passkeys');
+
+		foreach ($passkeys as $passkey)
+		{
+			$passkeyNode = $passkeysNode->addChild('passkey');
+			$passkeyNode->addChild('label', htmlspecialchars($passkey->label, ENT_XML1));
+		}
+
+		// Push subscriptions
+		$query = $db->getQuery(true)
+			->select([
+				$db->quoteName('endpoint'),
+				$db->quoteName('created_on'),
+				$db->quoteName('user_agent'),
+			])
+			->from($db->quoteName('#__push_subscriptions'))
+			->where($db->quoteName('user_id') . ' = ' . $db->quote($userId));
+
+		$pushSubscriptions = $db->setQuery($query)->loadObjectList() ?: [];
+
+		$pushNode = $xml->addChild('push_subscriptions');
+
+		foreach ($pushSubscriptions as $sub)
+		{
+			$subNode = $pushNode->addChild('subscription');
+			$subNode->addChild('endpoint', htmlspecialchars($sub->endpoint, ENT_XML1));
+			$subNode->addChild('created_on', $sub->created_on ?? '');
+			$subNode->addChild('user_agent', htmlspecialchars($sub->user_agent ?? '', ENT_XML1));
+		}
+
+		return $xml->asXML();
+	}
+
 	protected function onBeforeDelete($id): void
 	{
 		$mySelf = $this->container->userManager->getUser();
 
-		// Cannot delete myself
+		// Allow self-deletion when the self_delete state flag is set
+		$selfDelete = (bool) $this->getState('self_delete', false);
+
+		if ($selfDelete && $id == $mySelf->getId())
+		{
+			// Still cannot delete the last Superuser
+			if ($this->isLastSuperUserAccount($id))
+			{
+				throw new RuntimeException(
+					$this->getLanguage()->text('PANOPTICON_USERS_ERR_CANT_DELETE_LAST_SUPER'), 403
+				);
+			}
+
+			return;
+		}
+
+		// Cannot delete myself (normal admin deletion)
 		if ($id == $mySelf->getId())
 		{
 			throw new RuntimeException($this->getLanguage()->text('PANOPTICON_USERS_ERR_CANT_DELETE_YOURSELF'), 403);

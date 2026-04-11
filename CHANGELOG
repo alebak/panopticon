@@ -1,8 +1,27 @@
 <?php die(); ?>
-Akeeba Panopticon 1.3.3
+Akeeba Panopticon 2.0.1
 ================================================================================
++ Filter sites by CMS version, PHP version, extension name, author, author URL, and update status in the Install Extension page [gh-962]
+
+Akeeba Panopticon 2.0.0
+================================================================================
++ User self-registration [gh-726]
++ PII self-management: legal policies, user consent, data export, and account self-deletion
++ Web Push notifications as a complementary channel alongside email
++ Check integrity of Joomla core files against known-good checksums [gh-20]
++ Remote / mass extension installation across multiple sites [gh-346]
++ reCAPTCHA Invisible and hCaptcha CAPTCHA providers for user registration
++ Administrator email notification when a new user registration awaits approval
++ Password complexity validation for user registration
++ CLI commands for managing groups, mail templates, tasks, and backup/scanner schedules
 + Links to the Connection Troubleshooting wiki page
++ Periodic auto-refresh of the sites overview table
++ Periodic auto-refresh of the site information page
 ~ PHP 8.5 compatibility
+~ Sort task type filter options alphabetically by translated name
+~ Docker image updated to PHP 8.4 [gh-957]
+# [LOW] Missing ACL entry for the site sections auto-refresh task
+# [LOW] PHP deprecation notice in session encryption when no secret is configured
 # [LOW] Cannot save the "Accurate PHP-CLI path" setting.
 # [MEDIUM] Missing PHP expiration dates can cause a fatal error displaying a site.
 # [MEDIUM] Invalid dates (e.g. in backups) can cause a fatal error.

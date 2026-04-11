@@ -32,6 +32,12 @@ trait ACLTrait
 		'about'         => [
 			'*' => ['*'],
 		],
+		'api'           => [
+			'*' => ['#'],
+		],
+		'apitokens'     => [
+			'*' => ['*'],
+		],
 		'actionsummarytasks' => [
 			'*' => ['*']
 		],
@@ -39,6 +45,14 @@ trait ACLTrait
 			'*' => ['*'],
 		],
 		'backuptasks'   => [
+			// We use per-site privileges in this controller
+			'*' => ['*'],
+		],
+		'checksumtasks' => [
+			// We use per-site privileges in this controller
+			'*' => ['*'],
+		],
+		'corechecksums' => [
 			// We use per-site privileges in this controller
 			'*' => ['*'],
 		],
@@ -63,6 +77,13 @@ trait ACLTrait
 		],
 		'emails'        => [
 			'*' => ['super'],
+		],
+		'extensioninstall' => [
+			'default' => ['*'],
+			'main'    => ['*'],
+			'review'  => ['*'],
+			'install' => ['*'],
+			'*'       => ['ø'],
 		],
 		'extupdates'    => [
 			'default' => ['*'],
@@ -101,10 +122,22 @@ trait ACLTrait
 			'challenge' => ['#'],
 			'login'     => ['#'],
 		],
+		'pushsubscriptions' => [
+			'*' => ['*'],
+		],
 		'passkey' => [
 			'*'         => ['*'],
 			'challenge' => ['#'],
 			'login'     => ['#'],
+		],
+		'policies' => [
+			'default' => ['#'],
+			'tos'     => ['#'],
+			'privacy' => ['#'],
+			'edit'    => ['super'],
+			'save'    => ['super'],
+			'cancel'  => ['super'],
+			'*'       => ['ø'],
 		],
 		'setup'         => [
 			'cron' => ['super'],
@@ -132,6 +165,7 @@ trait ACLTrait
 			// Reloading a site's information requires the read privilege on it
 			'refreshSiteInformation'             => ['read'],
 			'refreshExtensionsInformation'       => ['read'],
+			'refreshSections'                    => ['read'],
 			// Actions which modify the site need the run privilege
 			'fixJoomlaCoreUpdateSite'            => ['run'],
 			'scheduleJoomlaUpdate'               => ['run'],
@@ -160,12 +194,17 @@ trait ACLTrait
 			'unpublish' => ['super'],
 			'remove'    => ['super'],
 		],
+		'userconsent' => [
+			'*' => ['*'],
+		],
 		'users' => [
 			// Explicitly allowed tasks. Using * because they have their own access control (I can view / edit myself).
 			// Not adding other tasks means they are implicitly disallowed, even to superusers.
 			'*'            => ['ø'],
 			'pwreset'      => ['~'],
 			'confirmreset' => ['~'],
+			'register'     => ['~'],
+			'activate'     => ['~'],
 			'browse'       => ['super'],
 			'default'      => ['super'],
 			'add'          => ['super'],

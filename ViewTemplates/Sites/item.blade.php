@@ -15,6 +15,8 @@ use Awf\Uri\Uri;
 $favIcon = $this->item->getFavicon(asDataUrl: true, onlyIfCached: true);
 ?>
 
+@include('Main/webpush_prompt')
+
 <h3 class="mt-2 pb-1 border-bottom border-3 border-primary-subtle d-flex flex-row align-items-center gap-2">
     <span class="text-muted fw-light fs-4">#{{ $this->item->id }}</span>
     @if($favIcon)
@@ -84,6 +86,7 @@ $favIcon = $this->item->getFavicon(asDataUrl: true, onlyIfCached: true);
 <div class="container my-3">
     <div class="row g-3 mb-3">
         <div class="col-12 col-lg-6 order-1 order-lg-0">
+            <div id="siteSection-cmsUpdate">
             @if ($this->item->cmsType() === CMSType::JOOMLA)
                 {{-- Joomla! sites: Joomla!&reg; Update information --}}
                 @include('Sites/item_joomlaupdate')
@@ -91,23 +94,29 @@ $favIcon = $this->item->getFavicon(asDataUrl: true, onlyIfCached: true);
                 {{-- WordPress sites: WordPress update information --}}
                 @include('Sites/item_wpupdate')
             @endif
+            </div>
         </div>
 
         <div class="col-12 col-lg-6 order-0 order-lg-1">
+            <div id="siteSection-php">
             @include('Sites/item_php')
+            </div>
         </div>
     </div>
 
     @if($this->hasCollectedServerInfo())
     <div class="row g-3 mb-3">
         <div class="col-12">
+            <div id="siteSection-server">
             @include('Sites/item_server')
+            </div>
         </div>
     </div>
     @endif
 
     <div class="row g-3 mb-3">
         <div class="col-12">
+            <div id="siteSection-extensions">
             @if ($this->item->cmsType() === CMSType::JOOMLA)
                 {{-- Joomla! sites --}}
                 @include('Sites/item_extensions')
@@ -115,20 +124,35 @@ $favIcon = $this->item->getFavicon(asDataUrl: true, onlyIfCached: true);
                 {{-- WordPress sites --}}
                 @include('Sites/item_wpplugins')
             @endif
+            </div>
         </div>
     </div>
 
     <div class="row g-3 mb-3">
         <div class="col-12">
+            <div id="siteSection-backup">
             @include('Sites/item_backup')
+            </div>
         </div>
     </div>
 
     <div class="row g-3 mb-3">
         <div class="col-12">
+            <div id="siteSection-admintools">
             @include('Sites/item_admintools')
+            </div>
         </div>
     </div>
+
+    @if ($this->item->cmsType() === CMSType::JOOMLA)
+    <div class="row g-3 mb-3">
+        <div class="col-12">
+            <div id="siteSection-corechecksums">
+            @include('Sites/item_corechecksums')
+            </div>
+        </div>
+    </div>
+    @endif
 
     @if($this->canEdit)
         <div class="row g-3 mb-3">
